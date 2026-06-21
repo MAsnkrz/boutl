@@ -6,18 +6,25 @@ Monitors https://www.beautyoutlet.co.uk/ for the brands:
 Uses Shopify's public collection JSON API (no auth needed):
   https://www.beautyoutlet.co.uk/collections/{handle}/products.json
 
+Exact stock is probed via Shopify's cart API: attempting to add 501 units
+to the cart causes Shopify to silently cap the quantity at whatever is
+actually in stock (per Shopify's own docs). We read back the capped amount,
+then remove the line again. Used selectively (new listings, back-in-stock
+transitions) rather than on every product every run to stay efficient.
+
 Detects (Discord alerts fire ONLY for these):
   - New product listings (in stock only)
   - Price drops (decreased >1% and >£0.02)
-  - Restocks (stock increased meaningfully) / Back in stock
+  - Back in stock (was OOS, now available) — with exact stock count
 
-Does NOT alert on: price increases, stock decreases, going OOS.
+Does NOT alert on: price increases, going OOS.
 
 Deps: pip install requests
 """
 
 import json
 import os
+import re
 import time
 import random
 import requests
@@ -110,7 +117,10 @@ def parse_product(item, brand_name):
     """Parse a Shopify product JSON object into our format."""
     variants = item.get("variants", [])
 
-    # Use the first available variant, or just the first variant if none available
+    # Note: some Shopify stores (like this one) return `available: None`
+    # instead of True/False on every variant, making the flag useless as
+    # a gate. We keep it only as a soft hint; real stock always comes
+    # from the cart-probe (get_stock_via_cart), which is unconditional.
     available_variants = [v for v in variants if v.get("available")]
     variant = available_variants[0] if available_variants else (variants[0] if variants else {})
 
@@ -118,9 +128,8 @@ def parse_product(item, brand_name):
     compare_price = variant.get("compare_at_price", "")
     sku           = variant.get("sku", "")
 
-    # Total stock across all variants (Shopify exposes inventory only with
-    # certain API access; the public JSON usually only gives "available" bool)
-    in_stock = any(v.get("available") for v in variants) if variants else False
+    # Soft hint only — True only if explicitly True, never trusted alone
+    available_hint = any(v.get("available") is True for v in variants) if variants else False
 
     images = item.get("images", [])
     image  = images[0].get("src", "") if images else ""
@@ -128,17 +137,20 @@ def parse_product(item, brand_name):
     handle = item.get("handle", "")
 
     return {
-        "id":       str(item.get("id", "")),
-        "handle":   handle,
-        "title":    item.get("title", ""),
-        "url":      f"{BASE_URL}/products/{handle}",
-        "image":    image,
-        "sku":      sku or "",
-        "brand":    brand_name,
-        "price":    price,
+        "id":         str(item.get("id", "")),
+        "variant_id": str(variant.get("id", "")) if variant else "",
+        "handle":     handle,
+        "title":      item.get("title", ""),
+        "url":        f"{BASE_URL}/products/{handle}",
+        "image":      image,
+        "sku":        sku or "",
+        "brand":      brand_name,
+        "price":      price,
         "compare_price": compare_price if compare_price and compare_price != price else "",
-        "in_stock": in_stock,
-        "vendor":   item.get("vendor", ""),
+        "in_stock":   None,   # always determined later via cart probe
+        "available_hint": available_hint,
+        "stock":      None,   # filled in later via cart probe
+        "vendor":     item.get("vendor", ""),
         "product_type": item.get("product_type", ""),
     }
 
@@ -156,6 +168,84 @@ def fetch_all_target_brands():
                 all_products.append(p)
         time.sleep(REQUEST_DELAY + random.uniform(0, 1))
     return all_products
+
+
+def get_stock_via_cart(variant_id, probe_qty=501, retries=2):
+    """
+    Probe real stock by attempting to add `probe_qty` units to the cart.
+    Shopify caps the added quantity to whatever is actually in stock
+    (per Shopify's own Cart API docs: "the cart will instead add the
+    maximum available quantity"). We then remove the line again so
+    nothing lingers in a persistent cart.
+
+    Returns:
+      int  -> the actual stock count if it's below the probe quantity
+      ">={probe_qty}-1" sentinel -> stock is at or above the cap (effectively "500+")
+      None -> could not determine (request failed, OOS variant, etc.)
+    """
+    if not variant_id:
+        return None
+
+    add_url    = f"{BASE_URL}/cart/add.js"
+    change_url = f"{BASE_URL}/cart/change.js"
+
+    for attempt in range(retries):
+        try:
+            r = SESSION.post(
+                add_url,
+                json={"items": [{"id": int(variant_id), "quantity": probe_qty}]},
+                timeout=15,
+            )
+
+            if r.status_code == 422:
+                # Shopify returns 422 with a message describing the cap, e.g.
+                # "Only 7 left for <product> ..." — parse the number if present.
+                try:
+                    err = r.json()
+                    msg = err.get("message", "") or err.get("description", "")
+                except Exception:
+                    msg = r.text
+                m = re.search(r"only\s+(\d+)\s+left", msg, re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+                # Sold out entirely
+                if "sold out" in msg.lower() or "not available" in msg.lower():
+                    return 0
+                return None
+
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("items", [])
+            added_qty = None
+            for it in items:
+                if str(it.get("variant_id")) == str(variant_id):
+                    added_qty = it.get("quantity")
+                    break
+
+            # Clean up — remove what we just added so the cart stays empty
+            line_key = None
+            for it in items:
+                if str(it.get("variant_id")) == str(variant_id):
+                    line_key = it.get("key") or it.get("id")
+                    break
+            if line_key:
+                try:
+                    SESSION.post(change_url, json={"id": line_key, "quantity": 0}, timeout=10)
+                except Exception:
+                    pass
+
+            if added_qty is None:
+                return None
+            if added_qty >= probe_qty:
+                return f">={probe_qty - 1}"
+            return added_qty
+
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2)
+            else:
+                print(f"  [!] Stock probe error (variant {variant_id}): {e}")
+    return None
 
 # ---------------------------------------------------------------------------
 # PRICING HELPERS
@@ -188,13 +278,21 @@ def _base_fields(product):
     sku      = product.get("sku", "")
     brand    = product.get("brand", "")
     in_stock = product.get("in_stock", True)
+    stock    = product.get("stock")
     price    = product.get("price", "")
     sas_url  = selleramp_url(sku, effective_price(product))
 
+    if stock is not None:
+        stock_val = f"**{stock}** units" if isinstance(stock, int) else f"**{stock}** units"
+    elif in_stock:
+        stock_val = "✅ In stock"
+    else:
+        stock_val = "❌ Out of stock"
+
     fields = [
-        {"name": "🏷️ Brand", "value": brand if brand else "-",                        "inline": True},
-        {"name": "🔖 SKU",   "value": f"`{sku}`" if sku else "-",                      "inline": True},
-        {"name": "📊 Stock", "value": "✅ In stock" if in_stock else "❌ Out of stock",  "inline": True},
+        {"name": "🏷️ Brand", "value": brand if brand else "-", "inline": True},
+        {"name": "🔖 SKU",   "value": f"`{sku}`" if sku else "-", "inline": True},
+        {"name": "📊 Stock", "value": stock_val, "inline": True},
     ]
     if sas_url:
         fields.append({"name": "🔍 SellerAmp SAS", "value": f"[Open in SellerAmp]({sas_url})", "inline": False})
@@ -331,6 +429,8 @@ def snapshot_entry(product):
         "price":         product.get("price", ""),
         "compare_price": product.get("compare_price", ""),
         "in_stock":      product.get("in_stock", True),
+        "stock":         product.get("stock"),
+        "variant_id":    product.get("variant_id", ""),
         "first_seen":    product.get("first_seen", datetime.now(timezone.utc).isoformat()),
         "last_updated":  datetime.now(timezone.utc).isoformat(),
     }
@@ -392,11 +492,28 @@ def run_check():
 
     if is_first_run:
         print(f"  First run — building baseline from {len(all_products)} products (no alerts)...")
+        print(f"  Probing exact stock for every product via cart API — this will take a while...")
     else:
         print(f"  {len(all_products)} products fetched, {len(new_ids)} new")
 
     for i, product in enumerate(all_products, 1):
         pid = product["id"]
+
+        # Always probe stock via cart — this store's `available` flag returns
+        # None instead of True/False, so it can't be trusted as a gate.
+        if product.get("variant_id"):
+            time.sleep(REQUEST_DELAY + random.uniform(0, 0.5))
+            stock = get_stock_via_cart(product["variant_id"])
+            product["stock"] = stock
+            if isinstance(stock, str) and stock.startswith(">="):
+                product["in_stock"] = True
+            elif isinstance(stock, int):
+                product["in_stock"] = stock > 0
+            else:
+                # Probe failed — fall back to the soft hint rather than assuming OOS
+                product["in_stock"] = product.get("available_hint", True)
+        else:
+            product["in_stock"] = product.get("available_hint", True)
 
         if is_first_run:
             entry = snapshot_entry(product)
@@ -417,7 +534,7 @@ def run_check():
             entry["first_seen"] = old.get("first_seen", entry["first_seen"])
             snapshot[pid] = entry
 
-        if i % 100 == 0:
+        if i % 50 == 0:
             save_snapshot(snapshot)
             print(f"  Auto-saved at {i}/{len(all_products)}")
 
